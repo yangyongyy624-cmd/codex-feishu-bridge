@@ -1,0 +1,9 @@
+{
+  "models": [
+    {"slug": "deepseek-v4-flash", "provider": "deepseek"},
+    {"slug": "deepseek-v4-pro", "provider": "deepseek"},
+    {"slug": "qwen3-coder-plus", "provider": "qwen"},
+    {"slug": "qwen3.6-plus", "provider": "qwen"},
+    {"slug": "qwen3-coder-next", "provider": "qwen"}
+  ]
+}

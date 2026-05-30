@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.codex.bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/.nvm/versions/node/v22.22.2/bin/node</string>
+        <string>--env-file=/Users/YOUR_USERNAME/Developer/feishu-codex-bridge/proxy/.env</string>
+        <string>/Users/YOUR_USERNAME/Developer/feishu-codex-bridge/proxy/proxy_v4.mjs</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/Developer/feishu-codex-bridge/proxy</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/codex-bridge/proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/codex-bridge/proxy.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
