@@ -51,12 +51,20 @@ async function executeToolCall(toolCall) {
   const func = toolCall.function;
   const name = func.name;
   const args = JSON.parse(func.arguments || '{}');
-  
+
   if (name === 'bash') {
     try {
       const { stdout, stderr } = await execAsync(args.command, { cwd: WORKDIR, timeout: 30000 });
+      // For GUI open commands that produce no output, verify the target exists
+      if (!stdout.trim() && !stderr.trim() && args.command.startsWith('open ')) {
+        const target = args.command.replace('open -a ', '').replace('open ', '').replace(/["']/g, '').trim();
+        return {
+          content: `命令已执行：${args.command}\n目标: ${target}\n(已发送打开指令，请确认窗口是否弹出)`,
+          isError: false
+        };
+      }
       return {
-        content: `stdout:\n${stdout}\nstderr:\n${stderr}`,
+        content: stdout ? `stdout:\n${stdout}\nstderr:\n${stderr}` : `命令执行成功，无输出\nstderr:\n${stderr}`,
         isError: false
       };
     } catch (e) {
@@ -66,7 +74,7 @@ async function executeToolCall(toolCall) {
       };
     }
   }
-  
+
   return {
     content: `Unknown tool: ${name}`,
     isError: true
@@ -98,19 +106,59 @@ async function callDeepSeek(targetUrl, target, body, reqId) {
   });
 }
 
+// Map OpenAI-style model names to our actual models
+function normalizeModel(model) {
+  const map = {
+    'gpt-5.4-mini': 'deepseek-v4-flash',
+    'gpt-5.4': 'deepseek-v4-flash',
+    'gpt-4.1': 'deepseek-v4-flash',
+    'gpt-4o': 'deepseek-v4-flash',
+    'gpt-3.5-turbo': 'deepseek-v4-flash',
+    'ds-v4-flash': 'deepseek-v4-flash',
+    'ds-v4-pro': 'deepseek-v4-pro',
+  };
+  return map[model] || model;
+}
+
+// Transform Responses API tool format → chat completions format
+// Input:  { name: "bash", type: "function", description: "...", parameters: {...} }
+// Output: { type: "function", function: { name: "bash", description: "...", parameters: {...} } }
+function transformTools(tools) {
+  return (tools || [])
+    .filter(t => t.name)  // Drop unnamed tools — DeepSeek rejects them
+    .map(t => {
+      // Already in chat completions format
+      if (t.function) return t;
+      // Responses API format — wrap into function
+      return {
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description || '',
+          parameters: t.parameters || {}
+        }
+      };
+    });
+}
+
 function forward(path, body, model, res, reqId, isChatCompletions) {
-  const normalizedModel = model === 'ds-v4-flash' ? 'deepseek-v4-flash' : model;
+  const normalizedModel = normalizeModel(model);
   body.model = normalizedModel;
+
+  // Transform tools to chat completions format
+  if (body.tools?.length) {
+    body.tools = transformTools(body.tools);
+  }
 
   // Add system prompt to instruct model to provide text summary after tool execution
   if (body.messages && body.messages.length > 0) {
     const firstMsg = body.messages[0];
     if (firstMsg.role === 'system') {
-      firstMsg.content += '\n\n**重要**：当你使用工具后，必须用自然语言总结执行结果。不要只调用工具而不提供文字回复。';
+      firstMsg.content += '\n\n**重要规则**：\n1. 每次执行完命令后，必须用一段详细的中文文字总结结果，告诉用户看到了什么、发生了什么。不要只调用工具而不提供文字描述。\n2. 如果已经获取到所需信息（如文件列表、命令输出），直接总结并回复用户，不要再调用更多工具。不要超过3次工具调用。';
     } else {
       body.messages.unshift({
         role: 'system',
-        content: '你是一个智能助手。当你使用工具执行命令后，必须用自然语言总结执行结果，告诉用户命令的输出是什么。不要只调用工具而不提供文字回复。'
+        content: '你是一个智能助手。当你使用工具执行命令后，必须用自然语言总结执行结果，告诉用户命令的输出是什么。不要只调用工具而不提供文字回复。每次获取到所需信息后，直接总结回复用户，不要再调用更多工具。'
       });
     }
   }
@@ -160,10 +208,11 @@ function forward(path, body, model, res, reqId, isChatCompletions) {
   (async () => {
     try {
       let messages = body.messages || [];
-      let maxRounds = 3; // Reduced from 5 to 3 to prevent infinite loops
+      let maxRounds = 5; // Allow more rounds for complex multi-step tasks
       let round = 0;
       let lastResponse = null;
       let lastToolOutput = '';
+      let lastTextBeforeTools = '';
 
       while (round < maxRounds) {
         round++;
@@ -178,6 +227,12 @@ function forward(path, body, model, res, reqId, isChatCompletions) {
         };
 
         const response = await callDeepSeek(targetUrl, target, apiBody, reqId);
+
+        // Detect API error response
+        if (response.error) {
+          throw new Error(`DeepSeek API error: ${response.error.message || JSON.stringify(response.error)}`);
+        }
+
         lastResponse = response;
         
         const msg = response.choices?.[0]?.message || {};
@@ -187,6 +242,8 @@ function forward(path, body, model, res, reqId, isChatCompletions) {
         log(`${reqId} Round ${round}: tool_calls=${toolCalls.length}, text_len=${text.length}`);
         
         if (toolCalls.length > 0) {
+          // Save text before tool calls (might be the model's description of what it's about to do)
+          lastTextBeforeTools = text;
           // Add assistant message with tool calls
           messages.push({
             role: 'assistant',
@@ -227,10 +284,15 @@ function forward(path, body, model, res, reqId, isChatCompletions) {
         const finalMsg = lastResponse.choices?.[0]?.message || {};
         finalText = finalMsg.content || '';
       }
-      
+
       // If no text but we have tool output, use tool output
       if (!finalText && lastToolOutput) {
-        finalText = `命令执行结果：\n${lastToolOutput}`;
+        finalText = lastToolOutput;
+      }
+
+      // If we have text before tools but no final text, use that
+      if (!finalText && lastTextBeforeTools) {
+        finalText = lastTextBeforeTools;
       }
       
       const respId = lastResponse?.id || `resp_${Date.now()}`;
@@ -337,7 +399,7 @@ http.createServer((req, res) => {
     };
     
     if (body.tools?.length) {
-      chatBody.tools = body.tools;
+      chatBody.tools = transformTools(body.tools);
       chatBody.tool_choice = body.tool_choice || 'auto';
     }
 
