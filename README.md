@@ -1,42 +1,22 @@
-# Codex Feishu Bridge 🚀
+# Codex Feishu Bridge
 
-> **手机飞书控制 Mac 执行命令的完整解决方案**
+Codex APP + 飞书 双链路桥接。两套链路共用同一个本地代理（`127.0.0.1:4000`），同时运行。
 
-一个让 OpenAI Codex CLI 通过飞书（Lark）机器人接收消息并执行 Mac 终端命令的桥接系统。
+## 功能
 
-## ✨ 特性
+| 链路 | 能力 |
+|------|------|
+| **Codex APP** | 代码执行、文件读写、搜索（11个工具） |
+| **飞书** | 打开应用、运行命令、查看文件、纯文本对话（bash 工具） |
 
--  **飞书消息接收** - 通过飞书长连接接收消息
--  **终端命令执行** - 直接在 Mac 上执行 bash 命令
-- 🌐 **网页/应用打开** - 支持打开网页和应用程序
-- 📁 **文件操作** - 列出目录、查看文件等
-- 🤖 **AI 对话** - 非命令消息转发到 DeepSeek V4 获取 AI 回复
--  **开机自启** - 支持 macOS launchd 自动启动
--  **多模型支持** - DeepSeek V4、Qwen 系列模型
+## 快速开始
 
-## ️ 架构
-
-```
-飞书消息 → bridge_final.py → 直接命令执行 或 → proxy_v4.mjs → DeepSeek API
-终端 codex TUI ───────────────────────────→ proxy_v4.mjs → DeepSeek API
-```
-
-## 📦 安装
-
-### 前置条件
-
-- macOS 系统
-- Node.js 22+ (`nvm install 22 && nvm use 22`)
-- Python 3.10+
-- OpenAI Codex CLI (`npm install -g @openai/codex`)
-- DeepSeek API Key
-
-### 1. 克隆项目
+### 1. 安装依赖
 
 ```bash
-cd ~/Developer
-git clone https://github.com/YOUR_USERNAME/codex-feishu-bridge.git
 cd codex-feishu-bridge
+python3 -m venv .venv
+.venv/bin/pip install lark-oapi
 ```
 
 ### 2. 配置代理
@@ -44,115 +24,85 @@ cd codex-feishu-bridge
 ```bash
 cd proxy
 cp .env.example .env
-# 编辑 .env 填入你的 API Keys
+# 编辑 .env，填入真实 API 密钥
 ```
 
-### 3. 配置 Codex
+### 3. 配置 Codex APP
 
 ```bash
-mkdir -p ~/.codex
-cp ../config/codex-config.toml ~/.codex/config.toml
-cp ../config/codex-auth.json ~/.codex/auth.json
-cp ../config/proxy-models.json ~/.codex/proxy-models.json
-# 编辑 ~/.codex/auth.json 填入 PROXY_AUTH_KEY
-```
+# 编辑 ~/.codex/config.toml
+model_provider = "my-proxy"
+model = "deepseek-v4-flash"
+approval = "never"
 
-### 4. 安装 Python 依赖
+[model_providers.my-proxy]
+name = "my-proxy"
+base_url = "http://127.0.0.1:4000/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
 
 ```bash
-cd ../bridge
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# 编辑 ~/.codex/auth.json
+{"OPENAI_API_KEY": "sk-proxy-你的代理密钥"}
 ```
 
-### 5. 配置飞书应用
-
-1. 登录 [飞书开放平台](https://open.feishu.cn/app)
-2. 创建企业自建应用
-3. 启用 **机器人** 能力
-4. 添加事件订阅：`im.message.receive_v1`
-5. **事件接收模式** 选择 **长连接**（不要选 Webhook）
-6. 保存并发布应用版本
-
-## 🚀 使用
-
-### 启动代理
+### 4. 启动
 
 ```bash
-cd ~/Developer/codex-feishu-bridge/proxy
-node --env-file=.env proxy_v4.mjs &
+# 代理（推荐用 launchctl 开机自启）
+launchctl start com.codex.bridge
+
+# 飞书桥接
+export FEISHU_APP_ID=cli_xxx
+export FEISHU_APP_SECRET=xxx
+.venv/bin/python3 -u bridge_exec.py
+
+# Codex APP
+open /Applications/Codex.app
 ```
 
-### 启动飞书桥接
+## 飞书可执行命令示例
 
-```bash
-cd ~/Developer/codex-feishu-bridge/bridge
-source .venv/bin/activate
-FEISHU_APP_ID="你的AppID" \
-FEISHU_APP_SECRET="你的AppSecret" \
-PROXY_AUTH_KEY="你的ProxyKey" \
-WORKDIR="/Users/你的用户名" \
-python3 -u bridge_final.py
-```
+| 用户说 | 执行 | 返回 |
+|--------|------|------|
+| "打开 Google Chrome" | `open -a "Google Chrome"` | 确认已打开 |
+| "执行 ls -la" | `ls -la` | 目录列表总结 |
+| "查看系统内存" | `vm_stat` | 内存分析表格 |
+| "帮我写个脚本" | 纯文本对话 | 完整代码 |
 
-### 测试
-
-在飞书中给机器人发送：
+## 架构
 
 ```
-执行：echo hello
+用户 ──┬─ Codex APP ──────────────────┐
+       │                              ├── codex-bridge proxy (:4000) ──┬─ DeepSeek API
+       └─ 飞书 → bridge_exec.py ─────┘                                └─ 百炼 Coding Plan
 ```
 
-应该收到回复：
-```
-✅ 命令执行成功：
-hello
-```
+## 代理 v4 特性
 
-##  支持的命令
+1. **工具格式转换** — 自动转换 Responses API → chat completions 格式
+2. **模型名映射** — gpt-5.4-mini 等 OpenAI 模型名 → deepseek-v4-flash
+3. **无名工具过滤** — 过滤无 name 工具，避免 DeepSeek 反序列化错误
+4. **open 命令增强** — GUI 命令无输出时自动补充确认信息
+5. **系统提示增强** — 要求模型详细总结工具执行结果
 
-### 执行命令
-- `执行：echo hello`
-- `运行：ls -la`
+## 安全注意事项
 
-### 打开网页
-- `打开 https://www.google.com`
-- `打开 google`
+- ⚠️ **永远不要提交 `.env` 文件**
+- ⚠️ **不要硬编码 API Key 到代码中**
+- ⚠️ **飞书 AppSecret 通过环境变量传入**
 
-### 打开应用
-- `打开 Google Chrome`
-- `打开 Safari`
-- `打开 Terminal`
+## 故障排查
 
-### 列出文件
-- `列出桌面文件`
-- `查看 ~/Documents`
+| 现象 | 解决 |
+|------|------|
+| Codex APP 无回复 | 检查代理是否运行：`lsof -i :4000` |
+| 飞书无回复 | 检查 bridge_exec.py 是否运行 |
+| 代理报 502 | 确认 proxy_v4.mjs 在运行，不是 v2/v3 |
 
-## 🔧 开机自启
+完整文档见 [docs/SKILL.md](docs/SKILL.md)。
 
-```bash
-cp launchd/com.codex.bridge.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.codex.bridge.plist
-```
+## License
 
-## 📚 文档
-
-- [安装指南](docs/installation.md)
-- [配置说明](docs/configuration.md)
-- [故障排查](docs/troubleshooting.md)
-- [架构说明](docs/architecture.md)
-
-## 📄 许可证
-
-MIT License - 详见 [LICENSE](LICENSE)
-
-## 🙏 致谢
-
-- [OpenAI Codex CLI](https://github.com/openai/codex)
-- [DeepSeek](https://platform.deepseek.com)
-- [lark-oapi](https://github.com/larksuite/oapi-sdk-python)
-
----
-
-**注意：** 本项目为个人开源项目，仅供学习和交流使用。使用请遵守当地法律法规。
+MIT
