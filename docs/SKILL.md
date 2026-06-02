@@ -1,217 +1,291 @@
-# Codex Dual-Bridge (APP + 飞书)
+# 飞书双电脑控制 Skill
 
-Codex APP 和飞书桥接共用同一个本地代理（`127.0.0.1:4000`），**不冲突，同时运行**。
+> 通过飞书（Feishu/Lark）实现手机/另一台电脑远程 Mac 执行命令、运行代码、控制应用、文件管理。
+
+## 一句话说明
+
+在你的 Mac 上运行一个飞书桥接服务，手机飞书发消息 → Mac 本地执行命令 → 结果回传飞书。两台电脑之间通过飞书云端消息通道通信，无需公网 IP 或端口映射。
 
 ## 架构
 
 ```
-Codex APP ─────────────────────────┐
-                                   ├── codex-bridge proxy (:4000) ── DeepSeek / 百炼
-飞书 → bridge_exec.py ─────────────┘
+手机/另一台电脑                    你的 Mac
+┌──────────────┐              ┌──────────────────────────┐
+│   飞书 APP    │ ──云端──→    │  bridge_exec.py (飞书长连接) │
+│   (发消息)    │              │         ↓                  │
+│              │ ←─回复───    │  proxy_v4.mjs (:4000)      │
+└──────────────┘              │         ↓                  │
+                              │  DeepSeek / 百炼 / MiniMax │
+                              │         ↓                  │
+                              │  bash 工具 → 本地命令执行    │
+                              └──────────────────────────┘
 ```
 
-| 链路 | 请求特征 | 代理路由 |
+**核心思路**：飞书开放平台 WebSocket 长连接作为"控制通道"，Mac 本地 Python 服务接收消息，通过代理调用 LLM 解析意图，LLM 输出 bash 命令后在本地执行，结果回传飞书。
+
+## 能力矩阵
+
+| 类别 | 示例命令 | 实际执行 |
 |------|---------|---------|
-| Codex APP | 带 tools（11个，Responses API wire format） | 转换工具格式 → DeepSeek/百炼 |
-| 飞书 | 带 tools（bash），工具执行 + 纯文本对话 | 工具执行循环 → DeepSeek |
+| 应用控制 | "打开 Chrome" | `open -a "Google Chrome"` |
+| 终端命令 | "执行 ls -la" | `ls -la` |
+| 文件操作 | "查看 README.md" | `cat README.md` |
+| 系统信息 | "查看内存使用" | `vm_stat` / `top -l1` |
+| 代码执行 | "运行这个 Python 脚本" | `python3 script.py` |
+| 纯文本对话 | "帮我写个脚本" | LLM 直接生成代码 |
 
-## 关键文件
+## 快速部署
 
-| 文件 | 作用 |
-|------|------|
-| `~/Developer/feishu-codex-bridge/proxy/proxy_v4.mjs` | 代理核心（端口 4000） |
-| `~/Developer/feishu-codex-bridge/proxy/.env` | 代理配置（API keys） |
-| `~/Developer/feishu-codex-bridge/bridge_exec.py` | 飞书桥接服务（带 bash 工具执行） |
-| `~/.codex/config.toml` | Codex APP 配置（指向本地代理） |
-| `~/.codex/auth.json` | Codex APP 认证（proxy key） |
-| `~/Library/LaunchAgents/com.codex.bridge.plist` | 代理自启动服务 |
-| `/tmp/codex-bridge/proxy-access.log` | 代理访问日志（调试用） |
+### 前置条件
 
-## Codex APP 配置（完整）
+- Mac 上已安装 Node.js (v22+) 和 Python 3
+- 飞书开放平台应用（需要消息事件权限）
+- DeepSeek / 百炼 / MiniMax API Key（至少一个）
 
-### config.toml
+### 步骤 1：创建飞书开放平台应用
 
-```toml
-model_provider = "my-proxy"
-model = "deepseek-v4-flash"
-approval = "never"
+1. 访问 [飞书开放平台](https://open.feishu.cn/) → 创建企业自建应用
+2. 记录 **App ID** 和 **App Secret**
+3. 权限配置：添加 `im:message`、`im:message:send_as_bot` 权限
+4. 事件订阅：模式选择 **长连接 (WebSocket)**（不需要公网回调地址）
+5. 发布应用（需要管理员审批）
 
-[model_providers.my-proxy]
-name = "my-proxy"
-base_url = "http://127.0.0.1:4000/v1"
-wire_api = "responses"
-requires_openai_auth = true
-
-[projects."/Users/zujing"]
-trust_level = "trusted"
-
-[projects."/Users/zujing/Developer/feishu-codex-bridge"]
-trust_level = "trusted"
-
-[projects."/"]
-trust_level = "trusted"
-
-[desktop]
-conversationDetailMode = "STEPS_COMMANDS"
-ambient-suggestions-enabled = true
-```
-
-### auth.json
-
-```json
-{
-    "OPENAI_API_KEY": "sk-proxy-你的代理密钥"
-}
-```
-
-**说明**：
-- `base_url` 指向本地代理 `127.0.0.1:4000`，不走 OpenAI 服务器
-- `wire_api = "responses"` 使用 Responses API 格式（非旧版 chat）
-- `approval = "never"` 命令无需确认直接执行
-- `OPENAI_API_KEY` 必须和 `.env` 中的 `PROXY_AUTH_KEY` 一致
-- Codex APP 启动时会尝试连接 OpenAI 服务器做插件市场/遥测，这些连接在国内被墙（SYN_SENT），但不影响核心功能
-
-## 飞书能力（工具执行）
-
-飞书现在支持 bash 工具执行。用户发命令，Mac 本地执行：
-
-| 用户说 | 执行 | 返回 |
-|--------|------|------|
-| "打开 Google Chrome" | `open -a "Google Chrome"` | 确认已打开 |
-| "执行 ls -la" | `ls -la` | 目录列表总结 |
-| "帮我写个 Python 脚本" | 纯文本对话 | 代码 |
-| "查看系统内存" | `vm_stat` / `top` | 内存信息 |
-
-## 启动
-
-### 1. 启动代理（必须先启动）
-
-**方式一：通过 launchctl（推荐，开机自启）**
-```bash
-launchctl start com.codex.bridge
-```
-
-**方式二：手动启动**
-```bash
-cd ~/Developer/feishu-codex-bridge/proxy
-nohup node --env-file=.env proxy_v4.mjs >> /tmp/codex-bridge/proxy.log 2>&1 &
-```
-
-### 2. 启动飞书桥接
+### 步骤 2：克隆仓库并安装依赖
 
 ```bash
-cd ~/Developer/feishu-codex-bridge
-nohup .venv/bin/python3 -u bridge_exec.py >> /tmp/feishu-bridge.log 2>&1 &
+cd ~/Developer
+git clone https://github.com/YOUR_GITHUB_USERNAME/codex-feishu-bridge.git
+cd codex-feishu-bridge
+
+# Python 依赖
+python3 -m venv .venv
+.venv/bin/pip install lark-oapi
 ```
 
-### 3. 打开 Codex APP
+### 步骤 3：配置代理
 
 ```bash
-open /Applications/Codex.app
+cd proxy
+cp .env.example .env
 ```
 
-## 验证
+编辑 `.env`：
 
 ```bash
-# 两个服务都在
-lsof -i :4000          # 代理监听
-ps aux | grep bridge_exec | grep -v grep  # 飞书桥接
-
-# 测试飞书工具执行
-cd ~/Developer/feishu-codex-bridge
-.venv/bin/python3 -c "from bridge_exec import call_proxy; print(call_proxy('执行 pwd'))"
-
-# 测试 Codex APP 代理连通性
-curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:4000/v1/responses \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-proxy-你的代理密钥" \
-  -d '{"model":"deepseek-v4-flash","input":"hello","stream":false,"max_output_tokens":10}'
-
-# 代理日志（实时）
-tail -f /tmp/codex-bridge/proxy-access.log
+PROXY_AUTH_KEY=生成一个随机字符串
+DEEPSEEK_API_KEY=你的DeepSeek Key
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+QWEN_API_KEY=你的百炼 Key
+QWEN_BASE_URL=https://coding.dashscope.aliyuncs.com/v1
+QWEN_MODELS=qwen3-coder-plus,qwen3.6-plus
+PROXY_PORT=4000
+WORKDIR=/Users/你的用户名
 ```
 
-## 代理 v4 核心修复
+### 步骤 4：启动飞书桥接
 
-### 1. 工具格式转换 (`transformTools`)
-- Codex APP 发 `{name, type, description, parameters}`（Responses API 格式）
-- DeepSeek 要求 `{type: "function", function: {name, ...}}`（chat completions 格式）
-- 代理自动转换，否则 DeepSeek 返回反序列化错误 → 空回复
+```bash
+cd ~/Developer/codex-feishu-bridge
 
-### 2. 模型名映射 (`normalizeModel`)
-- Codex APP 可能发送 `gpt-5.4-mini`、`gpt-4o` 等 OpenAI 模型名
-- 代理自动映射到 `deepseek-v4-flash`
-- 映射表：
-  ```
-  gpt-5.4-mini → deepseek-v4-flash
-  gpt-5.4      → deepseek-v4-flash
-  gpt-4.1      → deepseek-v4-flash
-  gpt-4o       → deepseek-v4-flash
-  gpt-3.5-turbo→ deepseek-v4-flash
-  ds-v4-flash  → deepseek-v4-flash
-  ds-v4-pro    → deepseek-v4-pro
-  ```
+# 设置环境变量
+export FEISHU_APP_ID=你的AppID
+export FEISHU_APP_SECRET=你的AppSecret
+export PROXY_AUTH_KEY=与.env一致
+export WORKDIR=/Users/你的用户名
 
-### 3. 无名工具过滤
-- Codex APP 偶尔发送没有 `name` 字段的工具（第11个 agent 工具）
-- DeepSeek 直接报错 `missing field 'function'`
-- 代理过滤掉无 name 的工具
+# 启动
+.venv/bin/python3 -u bridge_exec.py
+```
 
-### 4. open 命令输出增强
-- macOS `open` 命令执行成功但不产生 stdout/stderr
-- 代理检测到 `open` 命令无输出时，自动补充确认信息
-- 避免模型因无输出而返回空回复
+看到以下输出即表示成功：
 
-### 5. 系统提示增强
-- 代理自动给每个请求添加中文系统提示
-- 要求模型详细总结工具执行结果，不要只说"已完成"
+```
+=======================================================
+  Feishu <-> Codex Bridge (codex exec mode)
+=======================================================
+  Feishu App ID:  cli_xxxxxxxx
+  Workdir:        /Users/xxx
 
-## 飞书桥接已增强的能力
+  Mode: 飞书云通讯长连接 + codex exec
+  Proxy: codex-bridge on port 4000 (DeepSeek)
+=======================================================
 
-- **bash 工具执行** — 飞书消息带 tools 定义，代理执行 bash 命令并返回结果
-- **最大 5 轮工具循环** — 模型可以连续调用多个命令
-- **自动添加系统提示** — 代理自动添加中文系统提示，要求模型总结工具结果
-- **工作目录已知** — 系统提示包含 `/Users/zujing` 和桌面路径，避免模型浪费时间搜索
+[feishu] Cloud communication WebSocket started
+```
+
+### 步骤 5：测试
+
+在手机飞书里给机器人发消息："执行 pwd"，应该返回工作目录路径。
+
+## 开机自启（推荐）
+
+### 代理自启
+
+```bash
+# 复制并编辑 launchd plist
+cp launchd/com.codex.bridge.plist ~/Library/LaunchAgents/
+# 编辑 ~/Library/LaunchAgents/com.codex.bridge.plist，替换 YOUR_USERNAME
+
+# 加载服务
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.codex.bridge.plist
+```
+
+### 飞书桥接自启
+
+创建 `~/Library/LaunchAgents/com.feishu.bridge.plist`：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.feishu.bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/Developer/codex-feishu-bridge/.venv/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/YOUR_USERNAME/Developer/codex-feishu-bridge/bridge_exec.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/Developer/codex-feishu-bridge</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FEISHU_APP_ID</key>
+        <string>你的AppID</string>
+        <key>FEISHU_APP_SECRET</key>
+        <string>你的AppSecret</string>
+        <key>PROXY_AUTH_KEY</key>
+        <string>与.env一致</string>
+        <key>WORKDIR</key>
+        <string>/Users/YOUR_USERNAME</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/feishu-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/feishu-bridge.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.feishu.bridge.plist
+```
+
+## ToggleFeishu — 一键开关
+
+Mac 菜单栏一键切换飞书连接开关，保护隐私或专注工作。
+
+### 原理
+
+通过 `/etc/hosts` 将飞书 WebSocket 域名 `msg-frontier.feishu.cn` 指向 `127.0.0.1`，断开长连接。移除后立即恢复。
+
+- **关闭飞书**：添加 hosts 规则 → 飞书 WS 断开 → 服务重启后连不上
+- **打开飞书**：移除 hosts 规则 → 服务重启后自动重连
+- Web UI 不受影响
+
+### 安装
+
+```bash
+# 1. 确保 toggle-feishu.sh 可执行
+chmod +x ~/Developer/codex-feishu-bridge/toggle-feishu.sh
+
+# 2. 将 ToggleFeishu.applescript 导出为 Application
+# 打开 AppleScript 编辑器 → 打开脚本 → 导出为 Application
+# 或者命令行：
+osacompile -o ~/Applications/ToggleFeishu.app ~/Developer/codex-feishu-bridge/ToggleFeishu.applescript
+```
+
+### 使用
+
+双击 `ToggleFeishu.app` → 输入 Mac 密码 → 切换状态。
+
+### 脚本逻辑
+
+```
+关闭时：
+  1. echo "127.0.0.1  msg-frontier.feishu.cn" >> /etc/hosts
+  2. 重启所有飞书相关服务 (hermes, bridge, openclaw)
+  3. 通知"飞书已关闭"
+
+打开时：
+  1. 从 /etc/hosts 移除飞书规则
+  2. 重启所有飞书相关服务
+  3. 通知"飞书已恢复"
+```
+
+## 代理核心：proxy_v4.mjs
+
+### 功能
+
+1. **Responses API → Chat Completions 转换**
+   - Codex APP 发 Responses API 格式，代理自动转为 DeepSeek 兼容的 chat completions 格式
+   - 工具定义自动包装 `{name, ...}` → `{type: "function", function: {name, ...}}`
+
+2. **模型名映射**
+   - OpenAI 风格模型名 → 实际后端模型
+   - `gpt-4o` → `deepseek-v4-flash`，`gpt-3.5-turbo` → `deepseek-v4-flash`
+
+3. **工具执行循环**
+   - 代理内置 bash 工具执行器
+   - 支持最多 5 轮连续工具调用
+   - `open` 命令特殊处理（GUI 命令无输出时自动补充确认）
+
+4. **系统提示增强**
+   - 自动注入中文系统提示，要求模型详细总结执行结果
+   - 限制工具调用次数，避免无限循环
+
+5. **多后端路由**
+   - 根据模型名自动路由到 DeepSeek / 百炼 / MiniMax
+
+### 端口和接口
+
+```
+端口: 4000 (PROXY_PORT 环境变量)
+
+接口:
+  GET  /v1/models          — 列出可用模型
+  POST /v1/responses       — Responses API（Codex APP 主用）
+  POST /v1/chat/completions — Chat Completions API
+```
+
+## 安全注意事项
+
+- **永远不要**提交 `.env` 文件或任何包含真实 API Key 的文件
+- 飞书 AppSecret 通过环境变量传入，不要硬编码
+- `PROXY_AUTH_KEY` 是本地代理认证密钥，只在 localhost 使用
+- `/etc/hosts` 操作需要 sudo 权限，toggle-feishu.sh 通过 AppleScript 弹窗获取
 
 ## 故障排查
 
-| 现象 | 原因 | 解决 |
+| 现象 | 检查 | 解决 |
 |------|------|------|
-| Codex APP 回复空 | 工具格式不匹配 | 检查 proxy_v4.mjs transformTools |
-| Codex APP 一直 Reconnecting | 代理没启动 | `lsof -i :4000` 确认端口监听 |
-| 飞书无回复 | bridge_exec.py 没运行 | 重新启动 |
-| 飞书回复空或很短 | proxy 版本不对 | 检查 `lsof -i :4000` 确认运行的是 `proxy_v4.mjs` |
-| 代理报 502 | DeepSeek 模型名不支持 | 检查 normalizeModel 映射 |
-| 代理不响应 | 端口 4000 未监听 | `lsof -i :4000`，重启 proxy |
+| 飞书无回复 | `ps aux | grep bridge_exec` | 重启 bridge_exec.py |
+| 代理不响应 | `lsof -i :4000` | 确认 proxy_v4.mjs 在运行 |
+| 回复为空或很短 | `ps aux | grep proxy_v` | 确认是 v4 版本，不是旧版 |
+| ToggleFeishu 不生效 | `grep feishu /etc/hosts` | 确认 hosts 规则是否正确 |
+| 飞书连不上 | 飞书开放平台事件配置 | 确认长连接模式已开启 |
+| 代理报 502 | 代理日志 | `tail -f /tmp/codex-bridge/proxy-access.log` |
 
-## ⚠️ 重要：proxy 版本一致性
+## 完整文件清单
 
-launchctl 服务 `com.codex.bridge` 管理 proxy 的自动启动。如果手动改代码但 proxy 不生效：
-
-```bash
-# 1. 停止当前服务
-launchctl stop com.codex.bridge
-sleep 1
-launchctl bootout gui/$(id -u)/com.codex.bridge
-sleep 1
-
-# 2. 确认端口释放
-lsof -i :4000 -P -n  # 应该为空
-
-# 3. 重新启动
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.codex.bridge.plist
-
-# 4. 确认新版本运行
-ps aux | grep proxy_v | grep -v grep
 ```
-
-## Codex APP 配置检查清单
-
-如果 Codex APP 不能工作，依次检查：
-
-1. **config.toml** — `base_url` 是否为 `http://127.0.0.1:4000/v1`
-2. **config.toml** — `wire_api` 是否为 `responses`
-3. **auth.json** — `OPENAI_API_KEY` 是否与 `.env` 的 `PROXY_AUTH_KEY` 一致
-4. **代理** — `lsof -i :4000` 是否有进程监听
-5. **代理版本** — `ps aux | grep proxy_v` 确认是 `proxy_v4.mjs`
-6. **网络** — Codex APP 连接 OpenAI 服务器会 SYN_SENT（被墙），但不影响功能，忽略即可
+codex-feishu-bridge/
+├── bridge_exec.py          # 飞书桥接主服务（WebSocket 长连接 + bash 工具）
+├── toggle-feishu.sh        # /etc/hosts 方式飞书开关（需 sudo）
+├── ToggleFeishu.applescript # macOS 应用封装（双击运行）
+├── proxy/
+│   ├── proxy_v4.mjs        # 代理核心（端口 4000，工具转换，多后端路由）
+│   └── .env.example        # 环境变量模板
+├── launchd/
+│   └── com.codex.bridge.plist  # macOS 开机自启配置
+├── config/
+│   ├── codex-config.toml.example  # Codex APP 配置模板
+│   ├── codex-auth.json.example    # Codex APP 认证模板
+│   └── proxy-models.json.example  # 代理支持的后端模型
+└── README.md               # 项目说明
+```
